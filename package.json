@@ -31,9 +31,10 @@
     "bluebird-retry": "^0.8.0",
     "gpsoauthnode": "0.0.5",
     "long": "^3.2.0",
-    "node-pogo-protos": "^1.1.0",
+    "node-pogo-protos": "^1.2.0",
     "request": "^2.73.0",
-    "s2-geometry": "^1.2.7"
+    "s2-geometry": "^1.2.7",
+    "node-pogo-signature": "https://github.com/SpencerSharkey/node-pogo-signature.git"
   },
   "devDependencies": {
     "eslint": "^3.1.1",
