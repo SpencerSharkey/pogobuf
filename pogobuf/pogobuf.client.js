@@ -4,17 +4,18 @@ const crypto = require('crypto'),
     EventEmitter = require('events').EventEmitter,
     Long = require('long'),
     POGOProtos = require('node-pogo-protos'),
+    pogoSignature = require('node-pogo-signature'),
     Promise = require('bluebird'),
     request = require('request'),
     retry = require('bluebird-retry'),
-    Utils = require('./pogobuf.utils.js'),
-    pogoSignature = require('node-pogo-signature');
+    Utils = require('./pogobuf.utils.js');
 
 const RequestType = POGOProtos.Networking.Requests.RequestType,
     RequestMessages = POGOProtos.Networking.Requests.Messages,
     Responses = POGOProtos.Networking.Responses;
 
 const INITIAL_ENDPOINT = 'https://pgorelease.nianticlabs.com/plfe/rpc';
+const DEFAULT_MAP_OBJECTS_DELAY = 5;
 
 /**
  * Pokémon Go RPC client.
@@ -39,7 +40,6 @@ function Client() {
     this.setAuthInfo = function(authType, authToken) {
         self.authType = authType;
         self.authToken = authToken;
-        self.authTicket = null;
     };
 
     /**
@@ -62,6 +62,9 @@ function Client() {
      * @return {Promise} promise
      */
     this.init = function() {
+        self.signatureBuilder = new pogoSignature.Builder();
+        self.lastMapObjectsCall = 0;
+
         /*
             The response to the first RPC call does not contain any response messages even though
             the envelope includes requests, technically it wouldn't be necessary to send the
@@ -70,16 +73,14 @@ function Client() {
         */
         self.endpoint = INITIAL_ENDPOINT;
 
-        this.initTime = new Date().getTime();
-        this.SigBuilder = new pogoSignature.Builder();
-
         return self.batchStart()
             .getPlayer('0.31.1')
             .getHatchedEggs()
             .getInventory()
             .checkAwardedBadges()
-            .downloadSettings('54b359c97e46900f87211ef6e6dd0b7f2a3ea1f5')
-            .batchCall();
+            .downloadSettings()
+            .batchCall()
+            .then(self.processInitialData);
     };
 
     /**
@@ -131,6 +132,16 @@ function Client() {
      */
     this.setProxy = function(proxy) {
         self.proxy = proxy;
+    };
+
+    /**
+     * Enables or disables the built-in throttling of getMapObjects() calls based on the
+     * minimum refresh setting received from the server. Enabled by default, disable if you
+     * want to manage your own throttling.
+     * @param {boolean} enable
+     */
+    this.setMapObjectsThrottlingEnabled = function(enable) {
+        self.mapObjectsThrottlingEnabled = enable;
     };
 
     /**
@@ -746,8 +757,9 @@ function Client() {
         encoding: null
     });
 
-    this.endpoint = INITIAL_ENDPOINT;
     this.maxTries = 5;
+    this.mapObjectsThrottlingEnabled = true;
+    this.mapObjectsMinDelay = DEFAULT_MAP_OBJECTS_DELAY * 1000;
 
     /**
      * Executes a request and returns a Promise or, if we are in batch mode, adds it to the
@@ -839,6 +851,51 @@ function Client() {
     };
 
     /**
+     * Creates an RPC envelope with the given list of requests and adds the encrypted signature,
+     * or adds the signature to an existing envelope.
+     * @private
+     * @param {Object[]} requests - Array of requests to build
+     * @param {RequestEnvelope} [envelope] - Pre-built request envelope to sign
+     * @return {Promise} - A Promise that will be resolved with a RequestEnvelope instance
+     */
+    this.buildSignedEnvelope = function(requests, envelope) {
+        return new Promise((resolve, reject) => {
+            if (!envelope) {
+                try {
+                    envelope = self.buildEnvelope(requests);
+                } catch (e) {
+                    reject(new retry.StopError(e));
+                }
+            }
+
+            if (!envelope.auth_ticket) {
+                // Can't sign before we have received an auth ticket
+                resolve(envelope);
+                return;
+            }
+
+            self.signatureBuilder.setAuthTicket(envelope.auth_ticket);
+            self.signatureBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.altitude);
+
+            self.signatureBuilder.encrypt(envelope.requests, (err, sigEncrypted) => {
+                if (err) {
+                    reject(new retry.StopError(err));
+                    return;
+                }
+
+                envelope.unknown6.push(new POGOProtos.Networking.Envelopes.Unknown6({
+                    request_type: 6,
+                    unknown2: new POGOProtos.Networking.Envelopes.Unknown6.Unknown2({
+                        encrypted_signature: sigEncrypted
+                    })
+                }));
+
+                resolve(envelope);
+            });
+        });
+    };
+
+    /**
      * Executes an RPC call with the given list of requests, retrying if necessary.
      * @private
      * @param {Object[]} requests - Array of requests to send
@@ -847,42 +904,25 @@ function Client() {
      *     or true if there aren't any
      */
     this.callRPC = function(requests, envelope) {
+        // If the requests include a map objects request, make sure the minimum delay
+        // since the last call has passed
+        if (requests.some(r => r.type === RequestType.GET_MAP_OBJECTS)) {
+            var now = new Date().getTime(),
+                delayNeeded = self.lastMapObjectsCall + self.mapObjectsMinDelay - now;
+
+            if (delayNeeded > 0 && self.mapObjectsThrottlingEnabled) {
+                return Promise.delay(delayNeeded).then(() => self.callRPC(requests, envelope));
+            }
+
+            self.lastMapObjectsCall = now;
+        }
+
         if (self.maxTries <= 1) return self.tryCallRPC(requests, envelope);
 
         return retry(() => self.tryCallRPC(requests, envelope), {
             interval: 300,
             backoff: 2,
             max_tries: self.maxTries
-        });
-    };
-
-    /**
-     * simple function to build a signature
-     * @private
-     * @param {RequestEnvelope} [envelope] - Pre-built request envelope to use
-       @return {Promise} - A Promise that will be resolved with the envelope
-     */
-    this.buildSignature = function(envelope) {
-        return new Promise((resolve, reject) => {
-            if (envelope.auth_ticket) {
-                envelope.auth_info = null;
-                self.SigBuilder.setAuthTicket(envelope.auth_ticket);
-                self.SigBuilder.setLocation(envelope.latitude, envelope.longitude, envelope.altitude);
-                return self.SigBuilder.encrypt(envelope.requests, function(err, sigEncrypted) {
-                    if (err) {
-                        reject(Error(err));
-                    }
-                    envelope.unknown6.push(new POGOProtos.Networking.Envelopes.Unknown6({
-                        request_type: 6,
-                        unknown2: new POGOProtos.Networking.Envelopes.Unknown6.Unknown2({
-                            encrypted_signature: sigEncrypted
-                        })
-                    }));
-                    return resolve(envelope);
-                });
-            } else {
-                return resolve(envelope);
-            }
         });
     };
 
@@ -895,24 +935,13 @@ function Client() {
      *     or true if there aren't any
      */
     this.tryCallRPC = function(requests, envelope) {
-        return new Promise((resolve, reject) => {
-            if (!envelope) {
-                try {
-                    envelope = self.buildEnvelope(requests);
-                } catch (e) {
-                    reject(e);
-                    return;
-                }
-            }
-
-            self.buildSignature(envelope).then(reqEnvelope => {
-
-                var reqBody = reqEnvelope.encode().toBuffer();
+        return self.buildSignedEnvelope(requests, envelope)
+            .then(signedEnvelope => new Promise((resolve, reject) => {
                 self.request({
                     method: 'POST',
                     url: self.endpoint,
                     proxy: self.proxy,
-                    body: reqBody
+                    body: signedEnvelope.toBuffer()
                 }, (err, response, body) => {
                     if (err) {
                         reject(Error(err));
@@ -920,7 +949,14 @@ function Client() {
                     }
 
                     if (response.statusCode !== 200) {
-                        reject(Error('Status code ' + response.statusCode + ' received from HTTPS request'));
+                        if (response.statusCode >= 400 && response.statusCode < 500) {
+                            /* These are permanent errors so throw StopError */
+                            reject(new retry.StopError(
+                                `Status code ${response.statusCode} received from HTTPS request`));
+                        } else {
+                            /* Anything else might be recoverable so throw regular Error */
+                            reject(Error(`Status code ${response.statusCode} received from HTTPS request`));
+                        }
                         return;
                     }
 
@@ -997,7 +1033,8 @@ function Client() {
 
                             var responseMessage;
                             try {
-                                responseMessage = requests[i].responseType.decode(responseEnvelope.returns[i]);
+                                responseMessage = requests[i].responseType.decode(responseEnvelope.returns[
+                                    i]);
                             } catch (e) {
                                 self.emit('parse-response-error', responseEnvelope.returns[i].toBuffer(), e);
                                 reject(new retry.StopError(e));
@@ -1022,8 +1059,29 @@ function Client() {
                     else if (responses.length === 1) resolve(responses[0]);
                     else resolve(responses);
                 });
-            });
-        });
+            }));
+    };
+
+    /**
+     * Processes the data received from the initial API call during init().
+     * @private
+     * @param {Object[]} responses - Respones from API call
+     * @return {Object[]} respones - Unomdified responses (to send back to Promise)
+     */
+    this.processInitialData = function(responses) {
+        // Extract the minimum delay of getMapObjects()
+        if (responses.length >= 5) {
+            var settingsResponse = responses[4];
+            if (!settingsResponse.error &&
+                settingsResponse.settings &&
+                settingsResponse.settings.map_settings &&
+                settingsResponse.settings.map_settings.get_map_objects_min_refresh_seconds
+            ) {
+                self.mapObjectsMinDelay =
+                    settingsResponse.settings.map_settings.get_map_objects_min_refresh_seconds * 1000;
+            }
+        }
+        return responses;
     };
 }
 
